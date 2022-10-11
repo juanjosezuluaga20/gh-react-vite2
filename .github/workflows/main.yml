@@ -1,0 +1,173 @@
+name: Requirements Backend
+
+on:
+  workflow_call:
+    inputs:
+      project-name:
+        description: 'Project name which is gonna be the project identifier in SonarCloud'
+        required: true
+        type: string
+      project-key:
+        description: 'Project key which is gonna be the project identifier in SonarCloud'
+        required: true
+        type: string
+      organization:
+        description: 'SonarCloud organization'
+        required: false
+        default: 'bancodebogota'
+        type: string
+      language:
+        description: 'The language used to be analyzed'
+        required: true
+        default: ''
+        type: string
+      coverage-file:
+        description: 'Override the default value for coverage file if the default is not the right one'
+        required: false
+        default: ''
+        type: string
+      debug:
+        description: 'Override the default value for coverage file if the default is not the right one'
+        required: false
+        default: 'true'
+        type: string
+      sonar-project-properties-file:
+        description: 'Override the default value for coverage file if the default is not the right on'
+        required: false
+        default: ''
+        type: string
+      path-environments-variables: 
+        description: "Path of the three environment variables files"
+        required: true
+        type: string
+
+jobs:
+  security-checks:
+    runs-on: ubuntu-latest
+    needs: environment-files-changed
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+      - name: Checkout Security Check
+        uses: actions/checkout@v3
+        with:
+          repository: bancodebogota/bdb-dig-do-pipelines-action-securitycheck
+          ref: ''
+          token: ${{ secrets.DIG_READER_GITHUB_ACCESS_TOKEN }}
+          persist-credentials: false
+          path: ./.github/actions/bdb-dig-do-pipelines-action-securitycheck
+      - name: Security Check
+        uses: ./.github/actions/bdb-dig-do-pipelines-action-securitycheck
+      - name: Checkout Check Files Workflows
+        uses: actions/checkout@v3
+        with:
+          repository: bancodebogota/bdb-dig-do-action-check-files-workflows
+          ref: ''
+          token: ${{ secrets.DIG_READER_GITHUB_ACCESS_TOKEN }}
+          persist-credentials: false
+          path: ./.github/actions/bdb-dig-do-action-check-files-workflows
+      - name: Check Files Workflows
+        uses: ./.github/actions/bdb-dig-do-action-check-files-workflows
+        with:
+          technology: springboot
+          team: vc
+          reusable-workflow: "true"
+
+  environment-files-changed:
+    runs-on: ubuntu-latest
+    outputs:
+      only-update-variables: ${{steps.Files-Changed.outputs.only-update-variables}}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Checkout Files Changed Analyze
+        uses: actions/checkout@v3
+        with:
+          repository: bancodebogota/bdb-dig-do-pipelines-action-files-changed-analyze
+          ref: ''
+          token: ${{ secrets.DIG_READER_GITHUB_ACCESS_TOKEN }}
+          persist-credentials: false
+          path: ./.github/actions/bdb-dig-do-pipelines-action-files-changed-analyze
+      - name: Files Changed Analyze
+        id: Files-Changed
+        uses: ./.github/actions/bdb-dig-do-pipelines-action-files-changed-analyze
+        with:
+          path-environments-variables: ${{ inputs.path-environments-variables }}
+
+  build-test:
+    runs-on: ubuntu-latest
+    if: fromJSON(needs.environment-files-changed.outputs.only-update-variables) == 'false'
+    needs:
+      - environment-files-changed
+      - security-checks
+    env:
+      ARTIFACTORY_READER_USER: ${{ secrets.ARTIFACTORY_READER_USER }}
+      ARTIFACTORY_READER_API_KEY: ${{ secrets.ARTIFACTORY_READER_API_KEY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Setup Java
+        uses: actions/setup-java@v1
+        with:
+          java-version: '11'
+          java-package: jdk
+      - name: Restore Cache
+        uses: actions/cache@v3
+        env:
+          cache-name: java-github-actions
+        with:
+          path: ~/.m2
+          key: java-${{ env.cache-name }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: java-${{ env.cache-name }}-
+      - name: Run Build
+        run: |
+          mvn clean install dependency:go-offline -s settings.xml -Dread_user="${{ secrets.ARTIFACTORY_READER_USER }}" -Dread_api_key="${{ secrets.ARTIFACTORY_READER_API_KEY }}"
+      - name: Persist Target
+        uses: actions/upload-artifact@v3
+        with:
+          name: target
+          path: target/
+          retention-days: 1
+
+  sonar:
+    runs-on: ubuntu-latest
+    if: (fromJSON(needs.environment-files-changed.outputs.only-update-variables) == 'false' && contains(github.base_ref,'st/') == false ) || (contains(github.ref,'feature/') == false && github.base_ref == 'master')
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v3
+      - name: Cache Sonar
+        uses: actions/cache@v3
+        id: cache-sonar
+        with:
+          path: app
+          key: source-${{ github.event.repository.name }}-${{ hashFiles('src/**') }}
+      - name: Restore Target
+        uses: actions/download-artifact@v2
+        with:
+          name: target
+          path: target
+      - name: Checkout SonarCloud
+        uses: actions/checkout@v3
+        with:
+          repository: bancodebogota/bbog-dig-dt-sonarcloud-pipeline
+          ref: ""
+          token: ${{ secrets.DIG_READER_GITHUB_ACCESS_TOKEN }}
+          persist-credentials: false
+          path: ./.github/actions/bbog-dig-dt-sonarcloud-pipeline
+      - name: SonarCloud Scanner
+        if: steps.cache-sonar.outputs.cache-hit != 'true'
+        uses: ./.github/actions/bbog-dig-dt-sonarcloud-pipeline
+        with:
+          access-token: ${{ secrets.SONAR_CLOUD_TOKEN }}
+          project-name: ${{ inputs.project-name }}
+          project-key: ${{ inputs.project-key }}
+          organization: ${{ inputs.organization }}
+          current-branch: ${{ github.event.pull_request.base.ref }}
+          language: ${{ inputs.language }}
+          coverage-file: ${{ inputs.coverage-file }}
+          debug: ${{ inputs.debug }}
+          sonar-project-properties-file: ${{ inputs.sonar-project-properties-file }}
